@@ -1,0 +1,58 @@
+version: "3.8"
+services:
+  gateway:
+    image: node:20-slim
+    working_dir: /app
+    volumes:
+      - /srv/core/sparqplug/gateway:/app
+    command: >
+      sh -lc "set -e; npm init -y >/dev/null 2>&1 || true; npm pkg set type=commonjs >/dev/null 2>&1 || true;
+      npm i --no-audit --no-fund express helmet express-session connect-redis redis http-proxy-middleware;
+      node server.js"
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://shared-redis:6379
+      - SESSION_SECRET
+      - SESSION_NAME
+      - SESSION_DOMAIN
+      - PORTAL_HOST=portal.getsparqd.com
+    env_file:
+      - /srv/core/shared.env
+    ports:
+      - "127.0.0.1:8082:3000"
+    depends_on:
+      - app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - session-net
+
+  app:
+    image: node:20-slim
+    working_dir: /app
+    volumes:
+      - /srv/core/sparqplug/sparq-plug:/app
+    environment:
+      - NODE_ENV=development
+      - PORT=4000
+      - HOST=0.0.0.0
+    expose:
+      - "4000"
+    command: >
+      sh -lc "set -e;
+      if [ -f package.json ]; then
+        npm i --no-audit --no-fund;
+        if [ -f next.config.ts ] && ! npm ls typescript >/dev/null 2>&1; then npm i -D typescript; fi;
+        if npm run -s start; then :;
+        elif npm run -s dev; then :;
+        elif [ -f server.js ]; then node server.js;
+        else npx --yes next dev -H 0.0.0.0 -p 4000; fi;
+      else
+        echo 'No package.json found in /app; container idle'; sleep 3600;
+      fi"
+    networks:
+      - session-net
+
+networks:
+  session-net:
+    external: true

@@ -1,0 +1,33 @@
+services:
+  gateway:
+    image: node:20-slim
+    working_dir: /app
+    command: sh -c "npm install --omit=dev express helmet express-session connect-redis ioredis http-proxy-middleware && node server.js"
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://host.docker.internal:6379
+      - PORT=3000
+    env_file:
+      - /srv/core/shared.env
+    ports:
+      - "127.0.0.1:8082:3000"
+    volumes:
+      - /srv/core/sparqplug/gateway:/app:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    image: node:20-slim
+    working_dir: /app
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+    command: sh -c "set -e; if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi; if npm run -s start; then :; else if [ -f server.js ]; then node server.js; elif [ -f index.js ]; then node index.js; else node .; fi; fi"
+    volumes:
+      - /srv/core/sparqplug/sparq-plug:/app:rw
+    expose:
+      - "4000"
+    restart: unless-stopped
