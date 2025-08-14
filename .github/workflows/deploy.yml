@@ -1,0 +1,9 @@
+name: Deploy sparqplug
+on: { push: { branches: [ main ] } }
+jobs:
+  call:
+    uses: hligon35/server-deployer/.github/workflows/deploy.yml@main
+    with:
+      path: /srv/core/sparqplug
+      compose_file: /srv/core/sparqplug/docker-compose.yml
+      compose_services: "gateway app"
