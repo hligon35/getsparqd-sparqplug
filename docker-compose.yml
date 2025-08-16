@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   gateway:
     image: node:20-slim
@@ -12,10 +11,10 @@ services:
     environment:
       - NODE_ENV=production
       - REDIS_URL=redis://shared-redis:6379
-      - SESSION_SECRET
-      - SESSION_NAME
-      - SESSION_DOMAIN
+      - SESSION_NAME=portal.sid
+      - SESSION_DOMAIN=.getsparqd.com
       - PORTAL_HOST=portal.getsparqd.com
+      - APP_BASE_PATH=/app
     env_file:
       - /srv/core/shared.env
     ports:
@@ -33,23 +32,29 @@ services:
     volumes:
       - /srv/core/sparqplug/sparq-plug:/app
     environment:
-      - NODE_ENV=development
+      - NODE_ENV=production
       - PORT=4000
       - HOST=0.0.0.0
+      - NEXT_PUBLIC_BASE_PATH=/app
+      - NPM_CONFIG_PRODUCTION=false
+      - NEXT_TELEMETRY_DISABLED=1
     expose:
       - "4000"
-    command: >
-      sh -lc "set -e;
-      if [ -f package.json ]; then
-        npm i --no-audit --no-fund;
-        if [ -f next.config.ts ] && ! npm ls typescript >/dev/null 2>&1; then npm i -D typescript; fi;
-        if npm run -s start; then :;
-        elif npm run -s dev; then :;
-        elif [ -f server.js ]; then node server.js;
-        else npx --yes next dev -H 0.0.0.0 -p 4000; fi;
-      else
-        echo 'No package.json found in /app; container idle'; sleep 3600;
-      fi"
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        if [ -f package.json ]; then
+          npm ci --no-audit --no-fund || npm i --no-audit --no-fund
+          # Ensure TypeScript is available for next.config.ts by installing it explicitly
+          npm i --no-audit --no-fund typescript@5.9.2
+          rm -rf .next
+          npm run -s build
+          if [ -f .next/standalone/server.js ]; then node .next/standalone/server.js; else npm run -s start; fi
+        else
+          echo 'No package.json found in /app; container idle'; sleep 3600
+        fi
     networks:
       - session-net
 

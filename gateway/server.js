@@ -1,92 +1,244 @@
-const crypto = require('crypto');
+// Session + Redis (version-safe) — requires: const app = express() already defined above
 const express = require('express');
-const helmet = require('helmet');
-const session = require('express-session');
 const { createProxyMiddleware } = require('http-proxy-middleware');
-
-// Try modern class, then legacy factory
-let RedisStoreClass = null;
-try { RedisStoreClass = require('connect-redis').default; } catch (_) {}
-if (!RedisStoreClass) { try { RedisFactory = require('connect-redis'); } catch (_) {} }
-
-async function makeStore() {
-  const url = process.env.REDIS_URL || 'redis://host.docker.internal:6379';
-  try {
-    const { createClient } = require('redis');
-    const client = createClient({ url, legacyMode: true });
-    client.on('error', (err) => console.error('Redis error:', err));
-    await client.connect();
-    if (RedisStoreClass) return new RedisStoreClass({ client, prefix: 'sess:' });
-    if (RedisFactory) { const LegacyStore = RedisFactory(session); return new LegacyStore({ client, prefix: 'sess:' }); }
-  } catch (err) { console.warn('Redis unavailable; using MemoryStore temporarily:', err && err.message); }
-  return undefined; // MemoryStore
-}
-
-function b64url(buf){return buf.toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
-function b64urlDecode(s){s=s.replace(/-/g,'+').replace(/_/g,'/');return Buffer.from(s,'base64');}
-function verifyToken(t, secret){
-  if(!t || !t.includes('.')) return null;
-  const [b,sig]=t.split('.');
-  const body=b64urlDecode(b);
-  const expect=crypto.createHmac('sha256', secret).update(body).digest();
-  const got=b64urlDecode(sig);
-  if(expect.length!==got.length || !crypto.timingSafeEqual(expect,got)) return null;
-  const payload=JSON.parse(body.toString('utf8'));
-  const now=Math.floor(Date.now()/1000);
-  if(payload.exp && now>payload.exp+10) return null;
-  return payload;
-}
-
 const app = express();
-app.set('trust proxy', 1);
-app.use(helmet());
+const session = require('express-session');
+const connectRedis = require('connect-redis');
+const { createClient } = require('redis');
 
-const cookieName = process.env.SESSION_NAME || 'portal.sid';
-const sessionSecret = process.env.SESSION_SECRET || 'changeme';
-const cookieDomain = process.env.SESSION_DOMAIN || undefined;
-
-let store = undefined;
+const redisClient = createClient({ url: process.env.REDIS_URL });
 let storeReady = false;
-makeStore().then((s)=>{store=s; storeReady=!!s;}).catch(()=>{});
 
-app.use((req,res,next)=>{
-  session({
-    store,
-    name: cookieName,
-    secret: sessionSecret,
-    resave: false,
-    saveUninitialized: false,
-    proxy: true,
-    cookie: { httpOnly: true, sameSite: 'lax', secure: 'auto', domain: cookieDomain, maxAge: 1000*60*60*12 },
-  })(req,res,next);
+redisClient.on('error', (err) => { console.error('Redis error:', err); storeReady = false; });
+(async () => {
+  try {
+    await redisClient.connect();
+    storeReady = true;
+    console.log('Redis connected for session store');
+  } catch (e) {
+    console.error('Redis connect failed:', e.message);
+  }
+})();
+
+// Handle connect-redis v6 and v7
+let RedisStore;
+if (connectRedis && connectRedis.RedisStore) {
+  // v7: named export
+  RedisStore = connectRedis.RedisStore;
+} else if (typeof connectRedis === 'function' && connectRedis.length >= 1) {
+  // v6: factory returns Store class
+  RedisStore = connectRedis(session);
+} else if (connectRedis && connectRedis.default) {
+  // v7: default export is Store class
+  RedisStore = connectRedis.default;
+} else {
+  throw new Error('Unsupported connect-redis export shape');
+}
+
+app.set('trust proxy', 1);
+app.use(session({
+  name: process.env.SESSION_NAME || 'portal.sid',
+  secret: process.env.SESSION_SECRET || 'changeme',
+  resave: false,
+  saveUninitialized: false,
+  proxy: true,
+  cookie: {
+    domain: process.env.SESSION_DOMAIN || '.getsparqd.com',
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    path: '/',
+  },
+  store: new RedisStore({ client: redisClient }),
+}));
+
+// Normalize duplicate basePath occurrences like /app/app/login -> /app/login
+app.use((req, res, next) => {
+  const bp = process.env.APP_BASE_PATH || '';
+  if (!bp) return next();
+  if (req.url.startsWith(bp + bp)) {
+    let fixed = req.url;
+    while (fixed.startsWith(bp + bp)) fixed = fixed.slice(bp.length);
+    return res.redirect(301, fixed);
+  }
+  return next();
 });
 
-app.get('/healthz', (req,res)=>res.json({ ok:true, service:'sparqplug-gateway', storeReady }));
-
-// Signed entry only: accepts token and sets session, then redirects to target path
-app.get('/_entry', (req,res)=>{
-  const secret = process.env.SSO_SECRET || process.env.SESSION_SECRET || 'changeme';
-  const token = req.query.t;
-  const target = (req.query.path && String(req.query.path).startsWith('/')) ? req.query.path : '/';
-  const claims = verifyToken(token, secret);
-  if(!claims) return res.status(403).send('Invalid or expired token');
-  // Minimal session data; extend as needed
-  req.session.user = claims.user || { email: claims.email || '', role: claims.role || '' };
-  return res.redirect(target);
+// Health
+app.get('/healthz', (req, res) => {
+  res.json({ ok: true, service: 'sparqplug-gateway', storeReady });
 });
 
-// Everything else requires a session (direct hits get bounced to portal)
-const requireAuth = (req,res,next)=>{
+// Upstream app health: probe Next.js directly (bypasses auth/SSO)
+app.get('/_app_health', async (req, res) => {
+  const results = { ok: false, target: process.env.APP_URL || 'http://app:4000', checks: {} };
+  try {
+    const t0 = Date.now();
+    const rRoot = await fetch((process.env.APP_URL || 'http://app:4000') + '/', { method: 'HEAD' }).catch(() => null);
+    results.checks.root = rRoot ? { status: rRoot.status, ms: Date.now() - t0 } : { error: 'no response' };
+  } catch (e) {
+    results.checks.root = { error: e.message };
+  }
+  try {
+    const t1 = Date.now();
+    const rChunk = await fetch((process.env.APP_URL || 'http://app:4000') + '/_next/static/chunks', { method: 'HEAD' }).catch(() => null);
+    results.checks.chunks = rChunk ? { status: rChunk.status, ms: Date.now() - t1 } : { error: 'no response' };
+  } catch (e) {
+    results.checks.chunks = { error: e.message };
+  }
+  results.ok = [results.checks.root?.status, results.checks.chunks?.status].some(s => s && s >= 200 && s < 500);
+  res.status(results.ok ? 200 : 502).json(results);
+});
+
+// Small helper to map role to path
+function rolePath(role) {
+  return role === 'admin' ? '/admin' : role === 'manager' ? '/manager' : '/client';
+}
+
+const basePath = process.env.APP_BASE_PATH || '';
+
+// Require authenticated session for all non-health routes except login endpoints we handle below
+app.use((req, res, next) => {
+  if (req.path === '/healthz') return next();
+  // Allow Next.js internals and static assets under basePath (e.g., /app/_next/...)
+  const bp = basePath || '';
+  if (
+    (bp && req.path.startsWith(`${bp}/_next`)) ||
+    (bp && req.path.startsWith(`${bp}/assets`)) ||
+    (bp && req.path.startsWith(`${bp}/favicon`)) ||
+    req.path.startsWith('/_next') || req.path.startsWith('/assets') || req.path.startsWith('/favicon')
+  ) {
+    return next();
+  }
+  // Allow raw login paths to fall through to our login handler
+  const loginLike = req.path === '/login' || req.path === `${basePath}/login` || req.path.startsWith(`${basePath}${basePath}/login`);
+  if (loginLike) return next();
   if (req.session && req.session.user) return next();
-  const portalHost = process.env.PORTAL_HOST || 'portal.getsparqd.com';
-  const nextUrl = encodeURIComponent(`https://${req.headers.host}${req.originalUrl}`);
-  return res.redirect(`https://${portalHost}/login?next=${nextUrl}`);
-};
-app.use(requireAuth);
+  const portal = process.env.PORTAL_HOST || 'portal.getsparqd.com';
+  const host = req.headers.host || 'sparqplug.getsparqd.com';
+  const proto = 'https';
+  const returnTo = encodeURIComponent(`${proto}://${host}${req.originalUrl || '/'}`);
+  return res.redirect(`https://${portal}/login?sso=1&returnTo=${returnTo}`);
+});
 
-// Proxy to internal app
+// Redirect root to role landing (prefer basePath-prefixed URL)
+app.get('/', (req, res) => {
+  const role = (req.session?.user?.role) || 'client';
+  const target = `${basePath}${rolePath(role)}` || rolePath(role);
+  return res.redirect(302, target);
+});
+
+// Handle any form of login path, normalize duplicates, and redirect appropriately
+app.get(['/login', '/app/login', '/app/app/login'], (req, res) => {
+  const portal = process.env.PORTAL_HOST || 'portal.getsparqd.com';
+  const host = req.headers.host || 'sparqplug.getsparqd.com';
+  const proto = 'https';
+
+  if (req.session && req.session.user) {
+    const role = req.session.user.role || 'client';
+    const target = `${basePath}${rolePath(role)}` || rolePath(role);
+    return res.redirect(302, target);
+  }
+  const returnTo = encodeURIComponent(`${proto}://${host}${basePath}/login`);
+  return res.redirect(302, `https://${portal}/login?sso=1&returnTo=${returnTo}`);
+});
+
+// Minimal debug endpoint to verify session across subdomains
+app.get('/whoami', (req, res) => {
+  const user = req.session?.user;
+  res.json({ authenticated: !!user, role: user?.role || null, username: user?.username || null });
+});
+
+// Proxy everything else to the SparqPlug app
 const target = process.env.APP_URL || 'http://app:4000';
-app.use('/', createProxyMiddleware({ target, changeOrigin: true, ws: true, xfwd: true, proxyTimeout: 30000 }));
+app.use(
+  '/',
+  createProxyMiddleware({
+    target,
+    changeOrigin: true,
+    xfwd: true,
+    ws: true,
+    logLevel: 'warn',
+    // Avoid double-prefixing when incoming path already has basePath
+    pathRewrite: (path) => {
+      const bp = basePath || '';
+      // Normalize duplicate base paths just in case
+      if (bp && path.startsWith(bp + bp)) {
+        let fixed = path; while (fixed.startsWith(bp + bp)) fixed = fixed.slice(bp.length); path = fixed;
+      }
+      // Static assets: always serve from upstream /_next, regardless of incoming prefix
+      if (path.startsWith('/_next')) return path; // already correct
+      if (bp && path.startsWith(`${bp}/_next`)) return path.slice(bp.length); // strip basePath
+      // Common static roots
+      if (path.startsWith('/favicon') || path.startsWith('/assets')) return path;
+      if (bp && path.startsWith(`${bp}/favicon`)) return path.slice(bp.length);
+      if (bp && path.startsWith(`${bp}/assets`)) return path.slice(bp.length);
+      // For app routes, ensure basePath is present exactly once
+      if (!bp) return path;
+      return path.startsWith(bp) ? path : `${bp}${path}`;
+    },
+    onProxyReq: (proxyReq, req) => {
+      try {
+        if (req.session && req.session.user) {
+          const data = Buffer.from(JSON.stringify({
+            username: req.session.user.username,
+            role: req.session.user.role,
+          })).toString('base64');
+          proxyReq.setHeader('x-portal-user', data);
+          proxyReq.setHeader('x-auth-from', 'gateway');
+        }
+      } catch (_) { /* ignore */ }
+    },
+    onProxyRes: (proxyRes, req, res) => {
+      try {
+        // Ensure app can be embedded inside the portal iframe
+        if (proxyRes.headers) {
+          // Remove legacy frame header
+          delete proxyRes.headers['x-frame-options'];
+          // Remove frame-ancestors from CSP if present
+          const csp = proxyRes.headers['content-security-policy'];
+          if (typeof csp === 'string' && csp.includes('frame-ancestors')) {
+            const cleaned = csp
+              .split(';')
+              .map(s => s.trim())
+              .filter(d => !/^frame-ancestors\b/i.test(d))
+              .join('; ');
+            if (cleaned) proxyRes.headers['content-security-policy'] = cleaned;
+            else delete proxyRes.headers['content-security-policy'];
+          }
+        }
+        const bp = basePath || '';
+        if (!bp) return;
+        const loc = proxyRes.headers && proxyRes.headers['location'];
+        if (loc && typeof loc === 'string') {
+          // Normalize any duplicated basePath in Location headers
+          let fixed = loc;
+          const dup = bp + bp;
+          // Handle absolute and relative URLs
+          if (fixed.includes(dup)) {
+            while (fixed.includes(dup)) fixed = fixed.replace(dup, bp);
+            proxyRes.headers['location'] = fixed;
+          }
+          // If upstream tries to send authenticated users to /app/login, rewrite to role landing
+          const isLoginPath = (p) => {
+            try {
+              // consider both absolute and relative URLs
+              const u = new URL(p, `https://${req.headers.host || 'sparqplug.getsparqd.com'}`);
+              return u.pathname === `${bp}/login` || u.pathname === `/login`;
+            } catch { return p === `${bp}/login` || p === '/login'; }
+          };
+          if (isLoginPath(fixed) && req.session && req.session.user) {
+            const role = req.session.user.role || 'client';
+            const target = `${bp}${rolePath(role)}`;
+            proxyRes.headers['location'] = target;
+          }
+        }
+      } catch (_) { /* ignore */ }
+    },
+  })
+);
 
-const port = process.env.PORT || 3000;
-app.listen(port, ()=>console.log(`Gateway listening on ${port}, proxying to ${target}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Gateway listening on ${PORT}, proxying to ${process.env.APP_URL || 'http://app:4000'}`);
+});
